@@ -3,13 +3,81 @@
 -- Run once in Supabase SQL Editor
 -- ============================================================
 
+-- Disable body validation so sql helper functions can reference
+-- public.users before it is created in this same script.
+SET check_function_bodies = false;
+
 -- Extensions
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
 -- ============================================================
--- Helper functions (public schema — hosted Supabase forbids auth)
--- All marked SECURITY DEFINER SET search_path = '' to prevent
--- search_path injection while still calling auth.uid().
+-- Trigger functions first (plpgsql bodies are NOT validated at
+-- creation time, so no dependency on tables).
+-- ============================================================
+
+-- Stamp updated_at on every UPDATE.
+CREATE OR REPLACE FUNCTION public.set_updated_at()
+  RETURNS trigger LANGUAGE plpgsql
+  SET search_path = ''
+AS $$
+BEGIN
+  NEW.updated_at = now();
+  RETURN NEW;
+END;
+$$;
+
+-- Enforce that messages.salon_id matches its conversation's salon_id.
+CREATE OR REPLACE FUNCTION public.check_message_salon()
+  RETURNS trigger LANGUAGE plpgsql
+  SET search_path = ''
+AS $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM public.conversations
+    WHERE id = NEW.conversation_id AND salon_id = NEW.salon_id
+  ) THEN
+    RAISE EXCEPTION
+      'messages.salon_id does not match conversations.salon_id for conversation_id %',
+      NEW.conversation_id;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+-- ============================================================
+-- salons (no access_token_encrypted — lives in salon_secrets)
+-- ============================================================
+CREATE TABLE public.salons (
+  id                 uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+  name               text        NOT NULL,
+  phone_number_id    text,
+  waba_id            text,
+  timezone           text        NOT NULL DEFAULT 'UTC',
+  working_hours      jsonb       NOT NULL DEFAULT '{}',
+  google_review_link text,
+  bot_enabled        boolean     NOT NULL DEFAULT true,
+  created_at         timestamptz NOT NULL DEFAULT now()
+);
+
+-- ============================================================
+-- users  (mirrors auth.users via FK)
+-- Created BEFORE the sql helper functions so the functions can
+-- reference public.users without a "relation does not exist" error.
+-- ============================================================
+CREATE TABLE public.users (
+  id         uuid PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  salon_id   uuid REFERENCES public.salons(id) ON DELETE SET NULL,
+  role       text NOT NULL CHECK (role IN ('super_admin', 'owner', 'staff')),
+  name       text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_users_salon_id ON public.users(salon_id);
+
+-- ============================================================
+-- Helper functions (LANGUAGE sql — bodies are validated at
+-- creation time, so public.users must already exist above).
+-- All SECURITY DEFINER SET search_path = '' to prevent injection.
 -- ============================================================
 
 /** salon_id of the currently authenticated user. */
@@ -40,36 +108,8 @@ AS $$
 $$;
 
 -- ============================================================
--- Shared trigger function: stamp updated_at before every UPDATE
+-- RLS — salons
 -- ============================================================
-CREATE OR REPLACE FUNCTION public.set_updated_at()
-  RETURNS trigger LANGUAGE plpgsql
-  SET search_path = ''
-AS
-$$
-BEGIN
-  NEW.updated_at = now();
-  RETURN NEW;
-END;
-$$;
-
--- ============================================================
--- salons
--- access_token_encrypted deliberately removed — lives in
--- salon_secrets (service-role only, no client exposure).
--- ============================================================
-CREATE TABLE public.salons (
-  id                 uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
-  name               text        NOT NULL,
-  phone_number_id    text,
-  waba_id            text,
-  timezone           text        NOT NULL DEFAULT 'UTC',
-  working_hours      jsonb       NOT NULL DEFAULT '{}',
-  google_review_link text,
-  bot_enabled        boolean     NOT NULL DEFAULT true,
-  created_at         timestamptz NOT NULL DEFAULT now()
-);
-
 ALTER TABLE public.salons ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY "salons_select" ON public.salons
@@ -80,7 +120,7 @@ CREATE POLICY "salons_select" ON public.salons
 CREATE POLICY "salons_insert" ON public.salons
   FOR INSERT WITH CHECK (public.is_super_admin());
 
--- Only owner or super_admin may update their own salon record.
+-- Only owner or super_admin may update their salon record.
 CREATE POLICY "salons_update" ON public.salons
   FOR UPDATE USING (
     public.is_super_admin()
@@ -91,18 +131,8 @@ CREATE POLICY "salons_delete" ON public.salons
   FOR DELETE USING (public.is_super_admin());
 
 -- ============================================================
--- users  (mirrors auth.users via FK)
+-- RLS — users
 -- ============================================================
-CREATE TABLE public.users (
-  id         uuid PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
-  salon_id   uuid REFERENCES public.salons(id) ON DELETE SET NULL,
-  role       text NOT NULL CHECK (role IN ('super_admin', 'owner', 'staff')),
-  name       text NOT NULL,
-  created_at timestamptz NOT NULL DEFAULT now()
-);
-
-CREATE INDEX idx_users_salon_id ON public.users(salon_id);
-
 ALTER TABLE public.users ENABLE ROW LEVEL SECURITY;
 
 -- All salon members can see each other; super_admin sees everyone.
@@ -125,11 +155,10 @@ CREATE POLICY "users_insert" ON public.users
     )
   );
 
--- Fix: privilege escalation prevented in two layers.
--- USING  → who can be targeted (owners cannot touch super_admins or other salons).
--- WITH CHECK → what values are allowed in the new row:
---   • role cannot become 'super_admin' unless the updater is super_admin.
---   • salon_id cannot change unless the updater is super_admin.
+-- Privilege-escalation fix:
+-- USING  → owners cannot target super_admin rows or other salons.
+-- WITH CHECK → new row cannot set role='super_admin' (unless updater is super_admin)
+--              and cannot move the user to a different salon.
 CREATE POLICY "users_update" ON public.users
   FOR UPDATE
   USING (
@@ -137,7 +166,7 @@ CREATE POLICY "users_update" ON public.users
     OR (
       salon_id = public.current_salon_id()
       AND public.my_role() = 'owner'
-      AND role != 'super_admin'   -- owners cannot target super_admin rows
+      AND role != 'super_admin'
     )
   )
   WITH CHECK (
@@ -149,11 +178,9 @@ CREATE POLICY "users_delete" ON public.users
   FOR DELETE USING (public.is_super_admin());
 
 -- ============================================================
--- salon_secrets — WhatsApp access token isolation
--- RLS is ON but there are ZERO policies.
--- Result: only the service-role key (which bypasses RLS) can
--- read or write this table. The anon / authenticated keys get
--- nothing, even if they query it directly.
+-- salon_secrets — WhatsApp access token isolation.
+-- RLS ON + ZERO policies = only the service-role key can access.
+-- The anon / authenticated keys get nothing.
 -- ============================================================
 CREATE TABLE public.salon_secrets (
   salon_id               uuid PRIMARY KEY
@@ -164,7 +191,7 @@ CREATE TABLE public.salon_secrets (
 );
 
 ALTER TABLE public.salon_secrets ENABLE ROW LEVEL SECURITY;
--- Intentionally no policies — service-role only.
+-- Intentionally zero policies.
 
 -- ============================================================
 -- services (staff may read; only owner/super_admin may write)
@@ -183,7 +210,6 @@ CREATE INDEX idx_services_salon_id ON public.services(salon_id);
 
 ALTER TABLE public.services ENABLE ROW LEVEL SECURITY;
 
--- All salon users (including staff) need to read services (bot uses them).
 CREATE POLICY "services_select" ON public.services
   FOR SELECT USING (
     public.is_super_admin() OR salon_id = public.current_salon_id()
@@ -209,7 +235,7 @@ CREATE POLICY "services_delete" ON public.services
 
 -- ============================================================
 -- contacts (all salon users may read/insert/update;
---           only owner+ may delete)
+--           only owner/super_admin may delete)
 -- ============================================================
 CREATE TABLE public.contacts (
   id              uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -242,7 +268,6 @@ CREATE POLICY "contacts_update" ON public.contacts
     public.is_super_admin() OR salon_id = public.current_salon_id()
   );
 
--- Staff may not delete contacts; only owner or super_admin can.
 CREATE POLICY "contacts_delete" ON public.contacts
   FOR DELETE USING (
     public.is_super_admin()
@@ -288,7 +313,7 @@ CREATE POLICY "conversations_delete" ON public.conversations
     OR (salon_id = public.current_salon_id() AND public.my_role() = 'owner')
   );
 
--- Auto-stamp updated_at whenever a conversation row is updated.
+-- Auto-stamp updated_at on every conversation update.
 CREATE TRIGGER conversations_updated_at
   BEFORE UPDATE ON public.conversations
   FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
@@ -334,26 +359,7 @@ CREATE POLICY "messages_update" ON public.messages
 CREATE POLICY "messages_delete" ON public.messages
   FOR DELETE USING (public.is_super_admin());
 
--- Integrity check: a message's salon_id must match its conversation's salon_id.
--- Prevents cross-tenant data from being slipped in via a crafted conversation_id.
-CREATE OR REPLACE FUNCTION public.check_message_salon()
-  RETURNS trigger LANGUAGE plpgsql
-  SET search_path = ''
-AS
-$$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM public.conversations
-    WHERE id = NEW.conversation_id AND salon_id = NEW.salon_id
-  ) THEN
-    RAISE EXCEPTION
-      'messages.salon_id does not match conversations.salon_id for conversation_id %',
-      NEW.conversation_id;
-  END IF;
-  RETURN NEW;
-END;
-$$;
-
+-- Cross-tenant integrity: message.salon_id must match its conversation's salon_id.
 CREATE TRIGGER messages_salon_check
   BEFORE INSERT OR UPDATE ON public.messages
   FOR EACH ROW EXECUTE FUNCTION public.check_message_salon();
