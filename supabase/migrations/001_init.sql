@@ -43,7 +43,9 @@ $$;
 -- Shared trigger function: stamp updated_at before every UPDATE
 -- ============================================================
 CREATE OR REPLACE FUNCTION public.set_updated_at()
-  RETURNS trigger LANGUAGE plpgsql AS
+  RETURNS trigger LANGUAGE plpgsql
+  SET search_path = ''
+AS
 $$
 BEGIN
   NEW.updated_at = now();
@@ -335,7 +337,9 @@ CREATE POLICY "messages_delete" ON public.messages
 -- Integrity check: a message's salon_id must match its conversation's salon_id.
 -- Prevents cross-tenant data from being slipped in via a crafted conversation_id.
 CREATE OR REPLACE FUNCTION public.check_message_salon()
-  RETURNS trigger LANGUAGE plpgsql AS
+  RETURNS trigger LANGUAGE plpgsql
+  SET search_path = ''
+AS
 $$
 BEGIN
   IF NOT EXISTS (
