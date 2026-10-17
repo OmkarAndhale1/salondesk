@@ -1,36 +1,29 @@
 -- ============================================================
--- SalonDesk — Initial schema migration
--- Run in Supabase SQL Editor (or via Supabase CLI)
+-- SalonDesk — Initial schema migration (security-hardened)
+-- Run once in Supabase SQL Editor
 -- ============================================================
 
 -- Extensions
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
 -- ============================================================
--- Helper functions in public schema (hosted Supabase does not
--- allow CREATE in the auth schema).
--- SECURITY DEFINER + SET search_path = '' prevents search_path
--- injection while still allowing calls to auth.uid().
+-- Helper functions (public schema — hosted Supabase forbids auth)
+-- All marked SECURITY DEFINER SET search_path = '' to prevent
+-- search_path injection while still calling auth.uid().
 -- ============================================================
 
-/** Returns the salon_id of the currently logged-in user. */
+/** salon_id of the currently authenticated user. */
 CREATE OR REPLACE FUNCTION public.current_salon_id()
   RETURNS uuid
-  LANGUAGE sql
-  STABLE
-  SECURITY DEFINER
-  SET search_path = ''
+  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = ''
 AS $$
   SELECT salon_id FROM public.users WHERE id = auth.uid()
 $$;
 
-/** Returns true if the currently logged-in user is a super_admin. */
+/** true when the current user has role = 'super_admin'. */
 CREATE OR REPLACE FUNCTION public.is_super_admin()
   RETURNS boolean
-  LANGUAGE sql
-  STABLE
-  SECURITY DEFINER
-  SET search_path = ''
+  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = ''
 AS $$
   SELECT EXISTS (
     SELECT 1 FROM public.users
@@ -38,28 +31,62 @@ AS $$
   )
 $$;
 
+/** Role text of the currently authenticated user. */
+CREATE OR REPLACE FUNCTION public.my_role()
+  RETURNS text
+  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = ''
+AS $$
+  SELECT role FROM public.users WHERE id = auth.uid()
+$$;
+
+-- ============================================================
+-- Shared trigger function: stamp updated_at before every UPDATE
+-- ============================================================
+CREATE OR REPLACE FUNCTION public.set_updated_at()
+  RETURNS trigger LANGUAGE plpgsql AS
+$$
+BEGIN
+  NEW.updated_at = now();
+  RETURN NEW;
+END;
+$$;
+
 -- ============================================================
 -- salons
+-- access_token_encrypted deliberately removed — lives in
+-- salon_secrets (service-role only, no client exposure).
 -- ============================================================
 CREATE TABLE public.salons (
-  id                     uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
-  name                   text        NOT NULL,
-  phone_number_id        text,
-  waba_id                text,
-  access_token_encrypted text,                          -- never send to client
-  timezone               text        NOT NULL DEFAULT 'UTC',
-  working_hours          jsonb       NOT NULL DEFAULT '{}',
-  google_review_link     text,
-  bot_enabled            boolean     NOT NULL DEFAULT true,
-  created_at             timestamptz NOT NULL DEFAULT now()
+  id                 uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+  name               text        NOT NULL,
+  phone_number_id    text,
+  waba_id            text,
+  timezone           text        NOT NULL DEFAULT 'UTC',
+  working_hours      jsonb       NOT NULL DEFAULT '{}',
+  google_review_link text,
+  bot_enabled        boolean     NOT NULL DEFAULT true,
+  created_at         timestamptz NOT NULL DEFAULT now()
 );
 
 ALTER TABLE public.salons ENABLE ROW LEVEL SECURITY;
 
-CREATE POLICY "salons_select"  ON public.salons FOR SELECT USING      (public.is_super_admin() OR id = public.current_salon_id());
-CREATE POLICY "salons_insert"  ON public.salons FOR INSERT WITH CHECK  (public.is_super_admin());
-CREATE POLICY "salons_update"  ON public.salons FOR UPDATE USING       (public.is_super_admin() OR id = public.current_salon_id());
-CREATE POLICY "salons_delete"  ON public.salons FOR DELETE USING       (public.is_super_admin());
+CREATE POLICY "salons_select" ON public.salons
+  FOR SELECT USING (
+    public.is_super_admin() OR id = public.current_salon_id()
+  );
+
+CREATE POLICY "salons_insert" ON public.salons
+  FOR INSERT WITH CHECK (public.is_super_admin());
+
+-- Only owner or super_admin may update their own salon record.
+CREATE POLICY "salons_update" ON public.salons
+  FOR UPDATE USING (
+    public.is_super_admin()
+    OR (id = public.current_salon_id() AND public.my_role() = 'owner')
+  );
+
+CREATE POLICY "salons_delete" ON public.salons
+  FOR DELETE USING (public.is_super_admin());
 
 -- ============================================================
 -- users  (mirrors auth.users via FK)
@@ -76,14 +103,69 @@ CREATE INDEX idx_users_salon_id ON public.users(salon_id);
 
 ALTER TABLE public.users ENABLE ROW LEVEL SECURITY;
 
--- Users can see everyone in their own salon; super_admin sees all.
-CREATE POLICY "users_select"  ON public.users FOR SELECT USING      (public.is_super_admin() OR salon_id = public.current_salon_id() OR id = auth.uid());
-CREATE POLICY "users_insert"  ON public.users FOR INSERT WITH CHECK  (public.is_super_admin() OR salon_id = public.current_salon_id());
-CREATE POLICY "users_update"  ON public.users FOR UPDATE USING       (public.is_super_admin() OR (salon_id = public.current_salon_id() AND id = auth.uid()));
-CREATE POLICY "users_delete"  ON public.users FOR DELETE USING       (public.is_super_admin());
+-- All salon members can see each other; super_admin sees everyone.
+CREATE POLICY "users_select" ON public.users
+  FOR SELECT USING (
+    public.is_super_admin()
+    OR salon_id = public.current_salon_id()
+    OR id = auth.uid()
+  );
+
+-- Only super_admin or owner may add users.
+-- Nobody except super_admin may create a super_admin row.
+CREATE POLICY "users_insert" ON public.users
+  FOR INSERT WITH CHECK (
+    public.is_super_admin()
+    OR (
+      salon_id = public.current_salon_id()
+      AND public.my_role() = 'owner'
+      AND role != 'super_admin'
+    )
+  );
+
+-- Fix: privilege escalation prevented in two layers.
+-- USING  → who can be targeted (owners cannot touch super_admins or other salons).
+-- WITH CHECK → what values are allowed in the new row:
+--   • role cannot become 'super_admin' unless the updater is super_admin.
+--   • salon_id cannot change unless the updater is super_admin.
+CREATE POLICY "users_update" ON public.users
+  FOR UPDATE
+  USING (
+    public.is_super_admin()
+    OR (
+      salon_id = public.current_salon_id()
+      AND public.my_role() = 'owner'
+      AND role != 'super_admin'   -- owners cannot target super_admin rows
+    )
+  )
+  WITH CHECK (
+    (role != 'super_admin' OR public.is_super_admin())
+    AND (salon_id = public.current_salon_id() OR public.is_super_admin())
+  );
+
+CREATE POLICY "users_delete" ON public.users
+  FOR DELETE USING (public.is_super_admin());
 
 -- ============================================================
--- services
+-- salon_secrets — WhatsApp access token isolation
+-- RLS is ON but there are ZERO policies.
+-- Result: only the service-role key (which bypasses RLS) can
+-- read or write this table. The anon / authenticated keys get
+-- nothing, even if they query it directly.
+-- ============================================================
+CREATE TABLE public.salon_secrets (
+  salon_id               uuid PRIMARY KEY
+                             REFERENCES public.salons(id) ON DELETE CASCADE,
+  access_token_encrypted text,
+  created_at             timestamptz NOT NULL DEFAULT now(),
+  updated_at             timestamptz NOT NULL DEFAULT now()
+);
+
+ALTER TABLE public.salon_secrets ENABLE ROW LEVEL SECURITY;
+-- Intentionally no policies — service-role only.
+
+-- ============================================================
+-- services (staff may read; only owner/super_admin may write)
 -- ============================================================
 CREATE TABLE public.services (
   id           uuid          PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -99,22 +181,42 @@ CREATE INDEX idx_services_salon_id ON public.services(salon_id);
 
 ALTER TABLE public.services ENABLE ROW LEVEL SECURITY;
 
-CREATE POLICY "services_select"  ON public.services FOR SELECT USING      (public.is_super_admin() OR salon_id = public.current_salon_id());
-CREATE POLICY "services_insert"  ON public.services FOR INSERT WITH CHECK  (public.is_super_admin() OR salon_id = public.current_salon_id());
-CREATE POLICY "services_update"  ON public.services FOR UPDATE USING       (public.is_super_admin() OR salon_id = public.current_salon_id());
-CREATE POLICY "services_delete"  ON public.services FOR DELETE USING       (public.is_super_admin() OR salon_id = public.current_salon_id());
+-- All salon users (including staff) need to read services (bot uses them).
+CREATE POLICY "services_select" ON public.services
+  FOR SELECT USING (
+    public.is_super_admin() OR salon_id = public.current_salon_id()
+  );
+
+CREATE POLICY "services_insert" ON public.services
+  FOR INSERT WITH CHECK (
+    public.is_super_admin()
+    OR (salon_id = public.current_salon_id() AND public.my_role() = 'owner')
+  );
+
+CREATE POLICY "services_update" ON public.services
+  FOR UPDATE USING (
+    public.is_super_admin()
+    OR (salon_id = public.current_salon_id() AND public.my_role() = 'owner')
+  );
+
+CREATE POLICY "services_delete" ON public.services
+  FOR DELETE USING (
+    public.is_super_admin()
+    OR (salon_id = public.current_salon_id() AND public.my_role() = 'owner')
+  );
 
 -- ============================================================
--- contacts
+-- contacts (all salon users may read/insert/update;
+--           only owner+ may delete)
 -- ============================================================
 CREATE TABLE public.contacts (
   id              uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
   salon_id        uuid        NOT NULL REFERENCES public.salons(id) ON DELETE CASCADE,
-  wa_id           text        NOT NULL,               -- WhatsApp phone number string
+  wa_id           text        NOT NULL,
   name            text,
   last_inbound_at timestamptz,
   tags            text[]      NOT NULL DEFAULT '{}',
-  opted_out       boolean     NOT NULL DEFAULT false, -- STOP opt-out
+  opted_out       boolean     NOT NULL DEFAULT false,
   created_at      timestamptz NOT NULL DEFAULT now(),
   UNIQUE (salon_id, wa_id)
 );
@@ -123,19 +225,37 @@ CREATE INDEX idx_contacts_salon_id ON public.contacts(salon_id);
 
 ALTER TABLE public.contacts ENABLE ROW LEVEL SECURITY;
 
-CREATE POLICY "contacts_select"  ON public.contacts FOR SELECT USING      (public.is_super_admin() OR salon_id = public.current_salon_id());
-CREATE POLICY "contacts_insert"  ON public.contacts FOR INSERT WITH CHECK  (public.is_super_admin() OR salon_id = public.current_salon_id());
-CREATE POLICY "contacts_update"  ON public.contacts FOR UPDATE USING       (public.is_super_admin() OR salon_id = public.current_salon_id());
-CREATE POLICY "contacts_delete"  ON public.contacts FOR DELETE USING       (public.is_super_admin() OR salon_id = public.current_salon_id());
+CREATE POLICY "contacts_select" ON public.contacts
+  FOR SELECT USING (
+    public.is_super_admin() OR salon_id = public.current_salon_id()
+  );
+
+CREATE POLICY "contacts_insert" ON public.contacts
+  FOR INSERT WITH CHECK (
+    public.is_super_admin() OR salon_id = public.current_salon_id()
+  );
+
+CREATE POLICY "contacts_update" ON public.contacts
+  FOR UPDATE USING (
+    public.is_super_admin() OR salon_id = public.current_salon_id()
+  );
+
+-- Staff may not delete contacts; only owner or super_admin can.
+CREATE POLICY "contacts_delete" ON public.contacts
+  FOR DELETE USING (
+    public.is_super_admin()
+    OR (salon_id = public.current_salon_id() AND public.my_role() = 'owner')
+  );
 
 -- ============================================================
--- conversations
+-- conversations (all salon users may read/write)
 -- ============================================================
 CREATE TABLE public.conversations (
   id          uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
   salon_id    uuid        NOT NULL REFERENCES public.salons(id) ON DELETE CASCADE,
   contact_id  uuid        NOT NULL REFERENCES public.contacts(id) ON DELETE CASCADE,
-  status      text        NOT NULL DEFAULT 'bot' CHECK (status IN ('bot', 'human', 'closed')),
+  status      text        NOT NULL DEFAULT 'bot'
+                CHECK (status IN ('bot', 'human', 'closed')),
   assigned_to uuid        REFERENCES public.users(id) ON DELETE SET NULL,
   created_at  timestamptz NOT NULL DEFAULT now(),
   updated_at  timestamptz NOT NULL DEFAULT now()
@@ -145,10 +265,31 @@ CREATE INDEX idx_conversations_salon_id ON public.conversations(salon_id);
 
 ALTER TABLE public.conversations ENABLE ROW LEVEL SECURITY;
 
-CREATE POLICY "conversations_select"  ON public.conversations FOR SELECT USING      (public.is_super_admin() OR salon_id = public.current_salon_id());
-CREATE POLICY "conversations_insert"  ON public.conversations FOR INSERT WITH CHECK  (public.is_super_admin() OR salon_id = public.current_salon_id());
-CREATE POLICY "conversations_update"  ON public.conversations FOR UPDATE USING       (public.is_super_admin() OR salon_id = public.current_salon_id());
-CREATE POLICY "conversations_delete"  ON public.conversations FOR DELETE USING       (public.is_super_admin() OR salon_id = public.current_salon_id());
+CREATE POLICY "conversations_select" ON public.conversations
+  FOR SELECT USING (
+    public.is_super_admin() OR salon_id = public.current_salon_id()
+  );
+
+CREATE POLICY "conversations_insert" ON public.conversations
+  FOR INSERT WITH CHECK (
+    public.is_super_admin() OR salon_id = public.current_salon_id()
+  );
+
+CREATE POLICY "conversations_update" ON public.conversations
+  FOR UPDATE USING (
+    public.is_super_admin() OR salon_id = public.current_salon_id()
+  );
+
+CREATE POLICY "conversations_delete" ON public.conversations
+  FOR DELETE USING (
+    public.is_super_admin()
+    OR (salon_id = public.current_salon_id() AND public.my_role() = 'owner')
+  );
+
+-- Auto-stamp updated_at whenever a conversation row is updated.
+CREATE TRIGGER conversations_updated_at
+  BEFORE UPDATE ON public.conversations
+  FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
 
 -- ============================================================
 -- messages
@@ -161,10 +302,9 @@ CREATE TABLE public.messages (
   sender           text        NOT NULL CHECK (sender IN ('customer', 'bot', 'staff')),
   type             text        NOT NULL DEFAULT 'text',
   body             text,
-  wa_message_id    text,                              -- null for outbound until we get the ID back
+  wa_message_id    text,
   status           text        NOT NULL DEFAULT 'sent',
   created_at       timestamptz NOT NULL DEFAULT now(),
-  -- deduplication: wa_message_id must be unique within a salon
   UNIQUE (salon_id, wa_message_id)
 );
 
@@ -173,13 +313,49 @@ CREATE INDEX idx_messages_conversation_id ON public.messages(conversation_id);
 
 ALTER TABLE public.messages ENABLE ROW LEVEL SECURITY;
 
-CREATE POLICY "messages_select"  ON public.messages FOR SELECT USING      (public.is_super_admin() OR salon_id = public.current_salon_id());
-CREATE POLICY "messages_insert"  ON public.messages FOR INSERT WITH CHECK  (public.is_super_admin() OR salon_id = public.current_salon_id());
-CREATE POLICY "messages_update"  ON public.messages FOR UPDATE USING       (public.is_super_admin() OR salon_id = public.current_salon_id());
-CREATE POLICY "messages_delete"  ON public.messages FOR DELETE USING       (public.is_super_admin());
+CREATE POLICY "messages_select" ON public.messages
+  FOR SELECT USING (
+    public.is_super_admin() OR salon_id = public.current_salon_id()
+  );
+
+CREATE POLICY "messages_insert" ON public.messages
+  FOR INSERT WITH CHECK (
+    public.is_super_admin() OR salon_id = public.current_salon_id()
+  );
+
+CREATE POLICY "messages_update" ON public.messages
+  FOR UPDATE USING (
+    public.is_super_admin() OR salon_id = public.current_salon_id()
+  );
+
+-- Only super_admin may delete messages (preserve audit trail).
+CREATE POLICY "messages_delete" ON public.messages
+  FOR DELETE USING (public.is_super_admin());
+
+-- Integrity check: a message's salon_id must match its conversation's salon_id.
+-- Prevents cross-tenant data from being slipped in via a crafted conversation_id.
+CREATE OR REPLACE FUNCTION public.check_message_salon()
+  RETURNS trigger LANGUAGE plpgsql AS
+$$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM public.conversations
+    WHERE id = NEW.conversation_id AND salon_id = NEW.salon_id
+  ) THEN
+    RAISE EXCEPTION
+      'messages.salon_id does not match conversations.salon_id for conversation_id %',
+      NEW.conversation_id;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER messages_salon_check
+  BEFORE INSERT OR UPDATE ON public.messages
+  FOR EACH ROW EXECUTE FUNCTION public.check_message_salon();
 
 -- ============================================================
--- bookings
+-- bookings (all salon users may read/write; only owner+ deletes)
 -- ============================================================
 CREATE TABLE public.bookings (
   id               uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -187,7 +363,8 @@ CREATE TABLE public.bookings (
   contact_id       uuid        NOT NULL REFERENCES public.contacts(id),
   service_id       uuid        NOT NULL REFERENCES public.services(id),
   starts_at        timestamptz NOT NULL,
-  status           text        NOT NULL DEFAULT 'confirmed' CHECK (status IN ('confirmed', 'cancelled', 'done', 'no_show')),
+  status           text        NOT NULL DEFAULT 'confirmed'
+                CHECK (status IN ('confirmed', 'cancelled', 'done', 'no_show')),
   reminder_sent    boolean     NOT NULL DEFAULT false,
   review_requested boolean     NOT NULL DEFAULT false,
   created_at       timestamptz NOT NULL DEFAULT now()
@@ -198,13 +375,29 @@ CREATE INDEX idx_bookings_starts_at ON public.bookings(starts_at);
 
 ALTER TABLE public.bookings ENABLE ROW LEVEL SECURITY;
 
-CREATE POLICY "bookings_select"  ON public.bookings FOR SELECT USING      (public.is_super_admin() OR salon_id = public.current_salon_id());
-CREATE POLICY "bookings_insert"  ON public.bookings FOR INSERT WITH CHECK  (public.is_super_admin() OR salon_id = public.current_salon_id());
-CREATE POLICY "bookings_update"  ON public.bookings FOR UPDATE USING       (public.is_super_admin() OR salon_id = public.current_salon_id());
-CREATE POLICY "bookings_delete"  ON public.bookings FOR DELETE USING       (public.is_super_admin() OR salon_id = public.current_salon_id());
+CREATE POLICY "bookings_select" ON public.bookings
+  FOR SELECT USING (
+    public.is_super_admin() OR salon_id = public.current_salon_id()
+  );
+
+CREATE POLICY "bookings_insert" ON public.bookings
+  FOR INSERT WITH CHECK (
+    public.is_super_admin() OR salon_id = public.current_salon_id()
+  );
+
+CREATE POLICY "bookings_update" ON public.bookings
+  FOR UPDATE USING (
+    public.is_super_admin() OR salon_id = public.current_salon_id()
+  );
+
+CREATE POLICY "bookings_delete" ON public.bookings
+  FOR DELETE USING (
+    public.is_super_admin()
+    OR (salon_id = public.current_salon_id() AND public.my_role() = 'owner')
+  );
 
 -- ============================================================
--- templates
+-- templates (staff may read; only owner/super_admin may write)
 -- ============================================================
 CREATE TABLE public.templates (
   id         uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -220,7 +413,25 @@ CREATE INDEX idx_templates_salon_id ON public.templates(salon_id);
 
 ALTER TABLE public.templates ENABLE ROW LEVEL SECURITY;
 
-CREATE POLICY "templates_select"  ON public.templates FOR SELECT USING      (public.is_super_admin() OR salon_id = public.current_salon_id());
-CREATE POLICY "templates_insert"  ON public.templates FOR INSERT WITH CHECK  (public.is_super_admin() OR salon_id = public.current_salon_id());
-CREATE POLICY "templates_update"  ON public.templates FOR UPDATE USING       (public.is_super_admin() OR salon_id = public.current_salon_id());
-CREATE POLICY "templates_delete"  ON public.templates FOR DELETE USING       (public.is_super_admin() OR salon_id = public.current_salon_id());
+CREATE POLICY "templates_select" ON public.templates
+  FOR SELECT USING (
+    public.is_super_admin() OR salon_id = public.current_salon_id()
+  );
+
+CREATE POLICY "templates_insert" ON public.templates
+  FOR INSERT WITH CHECK (
+    public.is_super_admin()
+    OR (salon_id = public.current_salon_id() AND public.my_role() = 'owner')
+  );
+
+CREATE POLICY "templates_update" ON public.templates
+  FOR UPDATE USING (
+    public.is_super_admin()
+    OR (salon_id = public.current_salon_id() AND public.my_role() = 'owner')
+  );
+
+CREATE POLICY "templates_delete" ON public.templates
+  FOR DELETE USING (
+    public.is_super_admin()
+    OR (salon_id = public.current_salon_id() AND public.my_role() = 'owner')
+  );
