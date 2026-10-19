@@ -1,12 +1,13 @@
 import type { NextRequest } from 'next/server'
 import { z } from 'zod'
-import { createClient } from '@/lib/supabase/server'
+import { createSessionClient } from '@/lib/supabase/session'
 import { MockChannel } from '@/lib/channels/mock'
+import { checkRateLimit, rateLimitIdentity } from '@/lib/rate-limit'
 
 const schema = z.object({
-  salon_id:        z.string().uuid(),
+  salon_id:        z.string().uuid().optional(),
   conversation_id: z.string().uuid(),
-  sender:          z.enum(['staff', 'bot']),
+  sender:          z.literal('staff').optional(),
   text:            z.string().min(1).max(4096),
 })
 
@@ -26,15 +27,29 @@ export async function POST(request: NextRequest) {
     return Response.json({ error: parsed.error.flatten() }, { status: 400 })
   }
 
-  const { salon_id, conversation_id, sender, text } = parsed.data
-  const supabase = createClient()
+  const { conversation_id, text } = parsed.data
+  const supabase = await createSessionClient()
+  const { data: { user } } = await supabase.auth.getUser()
+  if (!user) return Response.json({ error: 'Authentication required' }, { status: 401 })
+  if (!await checkRateLimit(`send:${rateLimitIdentity(request, user.id)}`, 30, 60)) return Response.json({ error: 'Too many requests.' }, { status: 429 })
+
+  const { data: profile, error: profileError } = await supabase
+    .from('users')
+    .select('salon_id, role')
+    .eq('id', user.id)
+    .single()
+
+  if (profileError || !profile?.salon_id || !['owner', 'staff'].includes(profile.role)) {
+    return Response.json({ error: 'Salon access required' }, { status: 403 })
+  }
+  const salonId = profile.salon_id
 
   // Verify conversation exists and belongs to the given salon_id.
   const { data: conv, error: convError } = await supabase
     .from('conversations')
     .select('id, contact_id')
     .eq('id', conversation_id)
-    .eq('salon_id', salon_id)
+    .eq('salon_id', salonId)
     .single()
 
   if (convError ?? !conv) {
@@ -47,16 +62,19 @@ export async function POST(request: NextRequest) {
   // Load contact to get wa_id for MockChannel.
   const { data: contact, error: contactError } = await supabase
     .from('contacts')
-    .select('wa_id')
+    .select('wa_id,opted_out')
     .eq('id', (conv as { contact_id: string }).contact_id)
     .single()
 
   if (contactError ?? !contact) {
     return Response.json({ error: 'Contact not found' }, { status: 404 })
   }
+  if ((contact as { opted_out: boolean }).opted_out) {
+    return Response.json({ error: 'This contact has opted out of messages.' }, { status: 409 })
+  }
 
   // Send via the channel adapter (MockChannel logs to console).
-  const result = await channel.sendMessage(salon_id, {
+  const result = await channel.sendMessage(salonId, {
     to: (contact as { wa_id: string }).wa_id,
     type: 'text',
     body: text,
@@ -66,10 +84,10 @@ export async function POST(request: NextRequest) {
   const { data: message, error: msgError } = await supabase
     .from('messages')
     .insert({
-      salon_id,
+      salon_id: salonId,
       conversation_id,
       direction: 'out',
-      sender,
+      sender: 'staff',
       type: 'text',
       body: text,
       wa_message_id: result.waMessageId,
@@ -84,6 +102,12 @@ export async function POST(request: NextRequest) {
       { status: 500 }
     )
   }
+
+  await supabase
+    .from('conversations')
+    .update({ status: 'human' })
+    .eq('id', conversation_id)
+    .eq('salon_id', salonId)
 
   return Response.json(message, { status: 201 })
 }
