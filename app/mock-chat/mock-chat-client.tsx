@@ -60,7 +60,6 @@ export default function MockChatClient() {
 
   useEffect(() => {
     if (!started) return
-    void fetchMessages()
     const timer = setInterval(() => void fetchMessages(), 2000)
     return () => clearInterval(timer)
   }, [started, fetchMessages])
@@ -75,6 +74,7 @@ export default function MockChatClient() {
     e.preventDefault()
     if (!salonId.trim() || !waId.trim()) return
     setError(null)
+    void fetchMessages()
     setStarted(true)
   }
 

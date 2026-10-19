@@ -1,6 +1,9 @@
 import type { NextRequest } from 'next/server'
 import { z } from 'zod'
 import { createClient } from '@/lib/supabase/server'
+import { respondToInbound } from '@/lib/bot/runtime'
+import { MockChannel } from '@/lib/channels/mock'
+import { checkRateLimit, rateLimitIdentity } from '@/lib/rate-limit'
 
 const schema = z.object({
   salon_id:   z.string().uuid(),
@@ -9,8 +12,14 @@ const schema = z.object({
   text:       z.string().min(1).max(4096),
   message_id: z.string().max(128).optional(),
 })
+const channel = new MockChannel()
 
 export async function POST(request: NextRequest) {
+    if (process.env.NODE_ENV === 'production') {
+      return Response.json({ error: 'Not found' }, { status: 404 })
+    }
+    if (!await checkRateLimit(`mock-webhook:${rateLimitIdentity(request)}`, 30, 60)) return Response.json({ error: 'Too many requests.' }, { status: 429 })
+
   let body: unknown
   try {
     body = await request.json()
@@ -116,6 +125,33 @@ export async function POST(request: NextRequest) {
       { status: 500 }
     )
   }
+
+  if (text.trim().toUpperCase() === 'STOP') {
+    if (!(contact as { opted_out?: boolean }).opted_out) {
+      await supabase.from('contacts').update({ opted_out: true }).eq('id', contactId).eq('salon_id', salon_id)
+      const confirmation = 'You are opted out and will not receive further messages.'
+      const result = await channel.sendMessage(salon_id, { to: wa_id, type: 'text', body: confirmation })
+      await supabase.from('messages').insert({
+        salon_id,
+        conversation_id: conversationId,
+        direction: 'out',
+        sender: 'bot',
+        type: 'text',
+        body: confirmation,
+        wa_message_id: result.waMessageId,
+        status: 'sent',
+      })
+    }
+    return Response.json(message, { status: 201 })
+  }
+
+  await respondToInbound(supabase, {
+    salonId: salon_id,
+    contactId,
+    conversationId,
+    text,
+    messageId: (message as { id: string }).id,
+  })
 
   return Response.json(message, { status: 201 })
 }

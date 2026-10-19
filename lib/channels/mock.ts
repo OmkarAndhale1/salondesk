@@ -15,7 +15,7 @@ export class MockChannel implements ChannelAdapter {
     message: OutboundMessage
   ): Promise<SendResult> {
     const waMessageId = `mock_${Date.now()}_${Math.random().toString(36).slice(2)}`
-    console.log('[MockChannel] sendMessage', { message, waMessageId })
+    console.log('[MockChannel] sendMessage', { type: message.type, waMessageId })
     return { waMessageId }
   }
 

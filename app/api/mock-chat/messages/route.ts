@@ -1,6 +1,7 @@
 import type { NextRequest } from 'next/server'
 import { z } from 'zod'
 import { createClient } from '@/lib/supabase/server'
+import { checkRateLimit, rateLimitIdentity } from '@/lib/rate-limit'
 
 const querySchema = z.object({
   salon_id: z.string().uuid(),
@@ -8,6 +9,11 @@ const querySchema = z.object({
 })
 
 export async function GET(request: NextRequest) {
+    if (process.env.NODE_ENV === 'production') {
+      return Response.json({ error: 'Not found' }, { status: 404 })
+    }
+    if (!await checkRateLimit(`mock-chat:${rateLimitIdentity(request)}`, 60, 60)) return Response.json({ error: 'Too many requests.' }, { status: 429 })
+
   const params = Object.fromEntries(request.nextUrl.searchParams)
   const parsed = querySchema.safeParse(params)
   if (!parsed.success) {
