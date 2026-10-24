@@ -1,7 +1,9 @@
 import { z } from 'zod'
 import { createSessionClient } from '@/lib/supabase/session'
-import { MockChannel } from '@/lib/channels/mock'
+import { createClient } from '@/lib/supabase/server'
+import { createChannel } from '@/lib/channels/factory'
 import { checkRateLimit, rateLimitIdentity } from '@/lib/rate-limit'
+import { isWithinWorkingHours } from '@/lib/booking/slots'
 
 const createSchema = z.object({
   action: z.literal('create'),
@@ -17,8 +19,6 @@ const updateSchema = z.object({
 })
 
 const schema = z.discriminatedUnion('action', [createSchema, updateSchema])
-const channel = new MockChannel()
-
 export async function POST(request: Request) {
   let body: unknown
   try {
@@ -41,15 +41,19 @@ export async function POST(request: Request) {
 
   if (parsed.data.action === 'create') {
     const { contact_id, service_id, starts_at } = parsed.data
-    const [{ data: contact }, { data: service }] = await Promise.all([
-      supabase.from('contacts').select('id,wa_id,opted_out').eq('id', contact_id).eq('salon_id', salonId).single(),
+    const [{ data: contact }, { data: service }, { data: salon }] = await Promise.all([
+      supabase.from('contacts').select('id,wa_id,opted_out,last_inbound_at').eq('id', contact_id).eq('salon_id', salonId).single(),
       supabase.from('services').select('id,name,duration_min,price').eq('id', service_id).eq('salon_id', salonId).eq('active', true).single(),
+      supabase.from('salons').select('timezone,working_hours').eq('id', salonId).single(),
     ])
-    if (!contact || !service) return Response.json({ error: 'Contact or service not found.' }, { status: 404 })
+    if (!contact || !service || !salon) return Response.json({ error: 'Contact, service, or salon not found.' }, { status: 404 })
 
     const start = new Date(starts_at)
     if (start <= new Date()) return Response.json({ error: 'Booking time must be in the future.' }, { status: 400 })
     const end = new Date(start.getTime() + service.duration_min * 60_000)
+    if (!isWithinWorkingHours(start, end, salon.timezone, salon.working_hours as Record<string, { open: string; close: string } | null>)) {
+      return Response.json({ error: 'That appointment is outside the salon working hours.' }, { status: 400 })
+    }
     const { data: overlaps, error: overlapError } = await supabase
       .from('bookings')
       .select('id')
@@ -71,14 +75,14 @@ export async function POST(request: Request) {
     }).select('id,starts_at,ends_at,status').single()
     if (insertError || !booking) return Response.json({ error: 'Could not create booking.' }, { status: 409 })
 
-    await notifyCustomer(supabase, salonId, contact.id, contact.wa_id, contact.opted_out, `Your ${service.name} appointment is confirmed for ${start.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}.`)
+    await notifyCustomer(supabase, salonId, contact.id, contact.wa_id, contact.opted_out, contact.last_inbound_at, `Your ${service.name} appointment is confirmed for ${start.toLocaleString('en-IN', { timeZone: salon.timezone })}.`)
     return Response.json({ ...booking, service_name: service.name }, { status: 201 })
   }
 
   const { booking_id, status } = parsed.data
   const { data: booking } = await supabase
     .from('bookings')
-    .select('id,contact_id,service_id,starts_at,service:services(name),contact:contacts(wa_id,opted_out)')
+    .select('id,contact_id,service_id,starts_at,service:services(name),contact:contacts(wa_id,opted_out,last_inbound_at)')
     .eq('id', booking_id)
     .eq('salon_id', salonId)
     .single()
@@ -89,12 +93,12 @@ export async function POST(request: Request) {
   }).eq('id', booking_id).eq('salon_id', salonId)
   if (updateError) return Response.json({ error: 'Could not update booking.' }, { status: 500 })
 
-  const contact = booking.contact as unknown as { wa_id: string; opted_out: boolean }
+  const contact = booking.contact as unknown as { wa_id: string; opted_out: boolean; last_inbound_at: string | null }
   const service = booking.service as unknown as { name: string }
   const notice = status === 'cancelled'
     ? `Your ${service.name} appointment has been cancelled.`
     : `Your ${service.name} appointment status has been updated to ${status.replace('_', ' ')}.`
-  await notifyCustomer(supabase, salonId, booking.contact_id, contact.wa_id, contact.opted_out, notice)
+  await notifyCustomer(supabase, salonId, booking.contact_id, contact.wa_id, contact.opted_out, contact.last_inbound_at, notice)
   return Response.json({ id: booking.id, status })
 }
 
@@ -104,6 +108,7 @@ async function notifyCustomer(
   contactId: string,
   waId: string,
   optedOut: boolean,
+  lastInboundAt: string | null,
   text: string
 ) {
   if (optedOut) return
@@ -111,7 +116,7 @@ async function notifyCustomer(
     .select('id').eq('salon_id', salonId).eq('contact_id', contactId).neq('status', 'closed')
     .order('created_at', { ascending: false }).limit(1).maybeSingle()
   if (!conversation) return
-  const result = await channel.sendMessage(salonId, { to: waId, type: 'text', body: text })
+  const result = await createChannel(createClient()).sendMessage(salonId, { to: waId, type: 'text', body: text, lastInboundAt })
   await supabase.from('messages').insert({
     salon_id: salonId,
     conversation_id: conversation.id,

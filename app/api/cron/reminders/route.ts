@@ -1,5 +1,5 @@
 import { createClient } from '@/lib/supabase/server'
-import { MockChannel } from '@/lib/channels/mock'
+import { createChannel } from '@/lib/channels/factory'
 
 interface DueBooking {
   id: string
@@ -8,11 +8,10 @@ interface DueBooking {
   starts_at: string
   status: string
   service: { name: string } | null
-  contact: { wa_id: string; opted_out: boolean } | null
+  contact: { wa_id: string; opted_out: boolean; last_inbound_at: string | null } | null
   salon: { name: string; google_review_link: string | null } | null
 }
 
-const channel = new MockChannel()
 const runWindowMs = 15 * 60 * 1000
 
 export async function POST(request: Request) {
@@ -77,13 +76,17 @@ export async function POST(request: Request) {
   if (claimError) return Response.json({ error: 'Could not claim pending notifications.' }, { status: 500 })
   let sent = 0
   for (const item of claimed ?? []) {
-    const { data: contact } = await supabase.from('contacts').select('wa_id,opted_out').eq('id', item.contact_id).eq('salon_id', item.salon_id).single()
+    const { data: contact } = await supabase.from('contacts').select('wa_id,opted_out,last_inbound_at').eq('id', item.contact_id).eq('salon_id', item.salon_id).single()
     if (!contact || contact.opted_out) {
       await supabase.from('notification_outbox').update({ status: 'cancelled', locked_until: null }).eq('id', item.id)
       continue
     }
     try {
-      const result = await channel.sendMessage(item.salon_id, { to: contact.wa_id, type: 'text', body: item.body })
+      const { data: template } = await supabase.from('templates').select('name,language,components').eq('salon_id', item.salon_id).eq('category', item.kind).eq('status', 'approved').limit(1).maybeSingle()
+      const outbound = template
+        ? { to: contact.wa_id, type: 'template' as const, templateName: template.name, templateLanguage: template.language, templateComponents: Array.isArray(template.components) ? template.components : [] }
+        : { to: contact.wa_id, type: 'text' as const, body: item.body, lastInboundAt: contact.last_inbound_at }
+      const result = await createChannel(supabase).sendMessage(item.salon_id, outbound)
       const { data: conversation } = await supabase.from('conversations').select('id').eq('salon_id', item.salon_id).eq('contact_id', item.contact_id).neq('status', 'closed').order('created_at', { ascending: false }).limit(1).maybeSingle()
       if (conversation) {
         await supabase.from('messages').insert({ salon_id: item.salon_id, conversation_id: conversation.id, direction: 'out', sender: 'bot', type: 'text', body: item.body, wa_message_id: result.waMessageId, status: 'sent' })

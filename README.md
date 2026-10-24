@@ -4,9 +4,17 @@
 
 Install dependencies with `npm install`, copy `.env.example` to `.env.local`, and fill in the Supabase URL, anon key, service-role key, demo salon ID, and Gemini key. Keep `.env.local` out of version control. Then run `npm run dev`.
 
-In Supabase, create a project and open **SQL Editor**. Apply the migrations in numeric order: `001_init.sql`, `002_realtime.sql`, `003_salon_faq.sql`, `004_booking_integrity.sql`, `005_reminder_outbox.sql`, `006_schedule_reminders.sql`, and `007_bot_limits.sql`. Before applying `006_schedule_reminders.sql`, enable Supabase Vault, `pg_cron`, and `pg_net`, then add the Vault values described below.
+In Supabase, create a project and open **SQL Editor**. Apply the migrations in numeric order: `001_init.sql`, `002_realtime.sql`, `003_salon_faq.sql`, `004_booking_integrity.sql`, `005_reminder_outbox.sql`, `006_schedule_reminders.sql`, `007_bot_limits.sql`, and `008_whatsapp_delivery.sql`. Before applying `006_schedule_reminders.sql`, enable Supabase Vault, `pg_cron`, and `pg_net`, then add the Vault values described below.
 
 Run `npx tsx scripts/seed.ts` to create Glow Salon and its sample services. Add the resulting salon UUID to `NEXT_PUBLIC_DEMO_SALON_ID`.
+
+## WhatsApp Cloud API
+
+Set `WHATSAPP_PROVIDER=cloud`, `WHATSAPP_GRAPH_API_VERSION` to the Graph API version approved for the Meta app, `WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_APP_SECRET`, and a random 32-byte `TOKEN_ENCRYPTION_KEY` encoded as base64 or 64 hex characters. Keep these values only in server-side environment settings. The owner can save a salon phone-number ID, WABA ID, and access token through `/api/settings/whatsapp`; the access token is stored as AES-256-GCM ciphertext and is never returned.
+
+Configure Meta's callback as `https://your-domain.example/api/webhook/whatsapp` with the same verify token. The raw POST body is authenticated with `X-Hub-Signature-256`, and incoming events are mapped to a salon by the trusted `phone_number_id`. Message IDs are deduplicated and delivery statuses update stored messages.
+
+For reminders outside the 24-hour customer-service window, add approved rows to `templates` with categories `reminder_24h`, `reminder_2h`, or `review_request`, status `approved`, the Meta template name and language, and the required JSON `components`. Without an approved template, Cloud mode rejects a stale free-form send. `MockChannel` remains the default for local development and automated tests.
 
 Apply subsequent migrations in numeric order. Before applying `006_schedule_reminders.sql`, enable `pg_cron`, `pg_net`, and Vault in Supabase and add Vault secrets named `salondesk_app_url` (the deployed app origin) and `salondesk_cron_secret` (the same value configured as the app's `CRON_SECRET`). The schedule reads both values from Vault at request time; no secret is stored in migration source. Set `LOCAL_APP_URL` to test locally and run `npx tsx scripts/test-reminders.ts` with the required process environment.
 
@@ -16,11 +24,11 @@ Create the Glow Salon owner after seeding by passing its salon UUID and a strong
 
 ## Checks
 
-Run `npm run lint`, `npx tsc --noEmit`, `npm run build`, and `npx tsx scripts/test-slots.ts`. With Supabase credentials available in the process environment, run `npx tsx scripts/test-isolation.ts` to create and clean up disposable test tenants while checking RLS with anon-key sessions. With the app running and `CRON_SECRET` set, run `npx tsx scripts/test-reminders.ts`. `npx tsx scripts/test-bot.ts` sends 10 sample prompts to Gemini and prints its replies; review the output for correctness and safety.
+Run `npm run lint`, `npx tsc --noEmit`, `npm run build`, `npm run test:slots`, and `npm run test:whatsapp`. With Supabase credentials available in the process environment, run `npx tsx scripts/test-isolation.ts` to create and clean up disposable test tenants while checking RLS with anon-key sessions. With the app running and `CRON_SECRET` set, run `npx tsx scripts/test-reminders.ts`. `npx tsx scripts/test-bot.ts` sends 10 sample prompts to Gemini and prints its replies; review the output for correctness and safety.
 
 ## Environment variables
 
-Set the variables listed in `.env.example` in `.env.local` for local development and in your hosting provider's encrypted environment settings for deployment. `SUPABASE_SERVICE_ROLE_KEY` is server-only and must never use a `NEXT_PUBLIC_` prefix. `GEMINI_API_KEY` is required to run the bot. The WhatsApp-related variables are reserved for the later Meta integration and are not used by the current mock channel. Add `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN` to use shared Redis rate limits; without them the app falls back to process memory, which is not shared between serverless instances.
+Set the variables listed in `.env.example` in `.env.local` for local development and in your hosting provider's encrypted environment settings for deployment. `SUPABASE_SERVICE_ROLE_KEY`, `WHATSAPP_APP_SECRET`, and `TOKEN_ENCRYPTION_KEY` are server-only. `GEMINI_API_KEY` is required to run the bot. Add `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN` to use shared Redis rate limits; without them the app falls back to process memory, which is not shared between serverless instances.
 
 ## Supabase and cron
 
@@ -34,7 +42,7 @@ Reminder work is queued once per booking and claimed with a database lease. The 
 
 Import this repository into Vercel and configure the same server/client environment variables from `.env.example` in the project settings. Add Supabase URLs/keys and `GEMINI_API_KEY`; set a strong `CRON_SECRET`, then add the deployment origin and matching secret to Supabase Vault before applying the scheduling migration. Deploy only after applying the schema migrations and creating at least one super-admin/user profile. Verify login, RLS isolation, inbox Realtime, and cron responses in the deployed environment.
 
-The inbound webhook, send adapter, and demo chat in this build are mock/local-only. `NODE_ENV=production` disables `/mock-chat`, `/api/webhook/mock`, and `/api/mock-chat/messages`. A paying salon still needs the later Meta WhatsApp Cloud integration, webhook signature verification, approved templates, and provider delivery/idempotency handling. This plan does not make real WhatsApp messages or set up Vercel cron by itself; reminders are scheduled by Supabase `pg_cron`/`pg_net`.
+`NODE_ENV=production` disables `/mock-chat`, `/api/webhook/mock`, and `/api/mock-chat/messages`. Real Meta delivery still requires valid credentials, migration 008, approved templates, HTTPS webhook configuration, and Meta test-number verification. This project does not apply migrations or send real messages automatically; reminders are scheduled by Supabase `pg_cron`/`pg_net`.
 
 ## Pilot onboarding checklist
 
@@ -43,4 +51,4 @@ The inbound webhook, send adapter, and demo chat in this build are mock/local-on
 3. Add services, working hours, salon policies, and review link in Settings.
 4. Test the bot with representative salon questions and review its output.
 5. Create a test contact and appointment, verify the inbox flow, and exercise reminders.
-6. Before a paying pilot, complete Meta WhatsApp onboarding and replace the mock channel with the verified provider implementation.
+6. Set `WHATSAPP_PROVIDER=cloud`, apply migration 008, connect the Meta test number, configure the signed webhook, and verify an inbound and outbound message before a paying pilot.

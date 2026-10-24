@@ -15,6 +15,8 @@ export interface OutboundMessage {
   templateName?: string
   templateLanguage?: string
   templateComponents?: unknown[]
+  /** Required for free-form text so Cloud API sending enforces the 24-hour window. */
+  lastInboundAt?: string | null
 }
 
 export interface SendResult {
