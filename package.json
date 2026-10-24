@@ -7,7 +7,9 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "seed": "npx tsx scripts/seed.ts"
+    "seed": "npx tsx scripts/seed.ts",
+    "test:slots": "npx tsx scripts/test-slots.ts",
+    "test:whatsapp": "npx tsx scripts/test-whatsapp.ts"
   },
   "dependencies": {
     "@supabase/ssr": "^0.12.7",

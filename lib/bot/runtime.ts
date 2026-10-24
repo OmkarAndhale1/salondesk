@@ -1,11 +1,9 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { GeminiProvider } from '@/lib/llm/gemini'
 import type { LLMMessage, LLMTool } from '@/lib/llm/types'
-import { MockChannel } from '@/lib/channels/mock'
-import { generateSlots, localDateTimeToUtc, type WorkingHours } from '@/lib/booking/slots'
+import { createChannel } from '@/lib/channels/factory'
+import { generateSlots, isWithinWorkingHours, localDateTimeToUtc, type WorkingHours } from '@/lib/booking/slots'
 import { z } from 'zod'
-
-const channel = new MockChannel()
 
 const botTools: LLMTool[] = [
   { name: 'list_services', description: 'List services and prices offered by this salon.', parameters: { type: 'OBJECT', properties: {} } },
@@ -131,9 +129,9 @@ export async function respondToInbound(supabase: SupabaseClient, context: Inboun
 }
 
 async function sendBotMessage(supabase: SupabaseClient, context: InboundBotContext, text: string) {
-  const { data: contact } = await supabase.from('contacts').select('wa_id,opted_out').eq('id', context.contactId).eq('salon_id', context.salonId).single()
+  const { data: contact } = await supabase.from('contacts').select('wa_id,opted_out,last_inbound_at').eq('id', context.contactId).eq('salon_id', context.salonId).single()
   if (!contact || contact.opted_out) return
-  const sent = await channel.sendMessage(context.salonId, { to: contact.wa_id, type: 'text', body: text })
+  const sent = await createChannel(supabase).sendMessage(context.salonId, { to: contact.wa_id, type: 'text', body: text, lastInboundAt: contact.last_inbound_at })
   await supabase.from('messages').insert({
     salon_id: context.salonId,
     conversation_id: context.conversationId,
@@ -195,6 +193,7 @@ async function executeTool(
     const startsAt = new Date(args.data.starts_at)
     const endsAt = new Date(startsAt.getTime() + service.duration_min * 60_000)
     if (startsAt <= new Date()) return { error: 'That time is in the past. Offer future available times.' }
+    if (!isWithinWorkingHours(startsAt, endsAt, salon.timezone, salon.working_hours as WorkingHours)) return { error: 'That time is outside the salon working hours. Offer another slot.' }
     const { data: conflicts } = await supabase.from('bookings').select('id').eq('salon_id', context.salonId).eq('status', 'confirmed').lt('starts_at', endsAt.toISOString()).gt('ends_at', startsAt.toISOString()).limit(1)
     if (conflicts?.length) return { error: 'That time is no longer available. Offer other slots.' }
     const { data: booking, error } = await supabase.from('bookings').insert({
@@ -224,6 +223,7 @@ async function executeTool(
     const durationMinutes = Number((current.service as unknown as { duration_min: number }).duration_min)
     const startsAt = new Date(args.data.starts_at)
     const endsAt = new Date(startsAt.getTime() + durationMinutes * 60_000)
+    if (!isWithinWorkingHours(startsAt, endsAt, salon.timezone, salon.working_hours as WorkingHours)) return { error: 'That time is outside the salon working hours. Offer another slot.' }
     const { data: conflicts } = await supabase.from('bookings').select('id').eq('salon_id', context.salonId).eq('status', 'confirmed').neq('id', args.data.booking_id).lt('starts_at', endsAt.toISOString()).gt('ends_at', startsAt.toISOString()).limit(1)
     if (conflicts?.length) return { error: 'That time is unavailable. Offer other slots.' }
     const { error } = await supabase.from('bookings').update({ starts_at: startsAt.toISOString(), ends_at: endsAt.toISOString() }).eq('id', args.data.booking_id).eq('salon_id', context.salonId)

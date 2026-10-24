@@ -41,6 +41,22 @@ export function localDateTimeToUtc(date: string, time: string, timezone: string)
   return new Date(result)
 }
 
+export function isWithinWorkingHours(
+  startsAt: Date,
+  endsAt: Date,
+  timezone: string,
+  workingHours: WorkingHours,
+) {
+  if (endsAt <= startsAt) return false
+  const localParts = partsAt(startsAt, timezone)
+  const date = `${localParts.year}-${localParts.month}-${localParts.day}`
+  const hours = workingHours[weekday(date)]
+  if (!hours || !/^\d{2}:\d{2}$/.test(hours.open) || !/^\d{2}:\d{2}$/.test(hours.close)) return false
+  const open = localDateTimeToUtc(date, hours.open, timezone).getTime()
+  const close = localDateTimeToUtc(date, hours.close, timezone).getTime()
+  return startsAt.getTime() >= open && endsAt.getTime() <= close
+}
+
 function weekday(date: string) {
   const [year, month, day] = date.split('-').map(Number)
   return weekdayKeys[new Date(Date.UTC(year, month - 1, day)).getUTCDay()]

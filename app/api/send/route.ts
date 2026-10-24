@@ -1,7 +1,8 @@
 import type { NextRequest } from 'next/server'
 import { z } from 'zod'
 import { createSessionClient } from '@/lib/supabase/session'
-import { MockChannel } from '@/lib/channels/mock'
+import { createClient } from '@/lib/supabase/server'
+import { createChannel } from '@/lib/channels/factory'
 import { checkRateLimit, rateLimitIdentity } from '@/lib/rate-limit'
 
 const schema = z.object({
@@ -10,9 +11,6 @@ const schema = z.object({
   sender:          z.literal('staff').optional(),
   text:            z.string().min(1).max(4096),
 })
-
-// Singleton — one channel instance per serverless invocation is fine
-const channel = new MockChannel()
 
 export async function POST(request: NextRequest) {
   let body: unknown
@@ -59,10 +57,10 @@ export async function POST(request: NextRequest) {
     )
   }
 
-  // Load contact to get wa_id for MockChannel.
+  // Load contact from the authenticated salon scope.
   const { data: contact, error: contactError } = await supabase
     .from('contacts')
-    .select('wa_id,opted_out')
+    .select('wa_id,opted_out,last_inbound_at')
     .eq('id', (conv as { contact_id: string }).contact_id)
     .single()
 
@@ -73,11 +71,12 @@ export async function POST(request: NextRequest) {
     return Response.json({ error: 'This contact has opted out of messages.' }, { status: 409 })
   }
 
-  // Send via the channel adapter (MockChannel logs to console).
+  const channel = createChannel(createClient())
   const result = await channel.sendMessage(salonId, {
     to: (contact as { wa_id: string }).wa_id,
     type: 'text',
     body: text,
+    lastInboundAt: (contact as { last_inbound_at: string | null }).last_inbound_at,
   })
 
   // Persist outbound message.
